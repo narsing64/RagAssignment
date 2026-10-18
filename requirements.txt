@@ -1,0 +1,7 @@
+# Versions used in the submitted Kaggle run (Python 3, Tesla T4 GPU)
+google-genai==2.31.0
+pymupdf==1.28.2
+faiss-cpu==1.15.1
+sentence-transformers==5.7.0
+torch  # preinstalled on Kaggle (2.11.0+cu128 in the submitted run)
+numpy
