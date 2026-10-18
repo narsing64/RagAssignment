@@ -10,7 +10,7 @@ Everything (code, outputs, comments) is in one notebook: **[`RAG_Baseline_vs_Rer
 |---|---|
 | `RAG_Baseline_vs_Reranking.ipynb` | The full notebook, executed, with all outputs |
 | `requirements.txt` | Library versions used in the run |
-| `Report.md` / `Report.tex` | The report (Markdown and LaTeX versions of the same text) |
+| `Report.md` | The report |
 | `README.md` | This file |
 
 ## Document
