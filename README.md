@@ -11,6 +11,7 @@ Everything (code, outputs, comments) is in one notebook: **[`RAG_Baseline_vs_Rer
 | `RAG_Baseline_vs_Reranking.ipynb` | The full notebook, executed, with all outputs |
 | `requirements.txt` | Library versions used in the run |
 | `Report.md` | The report |
+| `parliament-activities-report-annual-2025-2026.pdf` | The input document (95 pages) |
 | `README.md` | This file |
 
 ## Document
@@ -82,7 +83,7 @@ Scoring all 266 chunks ranks the gold chunk of query 6 at #2.
 ## How to run (Kaggle)
 
 1. Create a Kaggle notebook and import `RAG_Baseline_vs_Reranking.ipynb` (**File → Import Notebook**).
-2. Upload the PDF as a Kaggle dataset (**Add Input → Upload**) and set `PDF_PATH` in Step 1 to its path (Cell 2 prints the path).
+2. Upload the PDF (`parliament-activities-report-annual-2025-2026.pdf`, included in this repository) as a Kaggle dataset (**Add Input → Upload**) and set `PDF_PATH` in Step 1 to its path (Cell 2 prints the path).
 3. Session options: **Internet On**, **Accelerator: GPU T4**.
 4. Add a Gemini API key (from [Google AI Studio](https://aistudio.google.com/apikey)) under **Add-ons → Secrets** with the name `GEMINI_API_KEY`, and attach it to the notebook.
 5. **Run All** (about 8–10 minutes).
