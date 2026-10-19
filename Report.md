@@ -29,7 +29,11 @@ Both pipelines use the same chunks, the same LLM and the same prompt. The only d
 
 ## 1. Architecture Comparison
 
-**Bi-encoder.** The bi-encoder reads the question and each chunk *separately*. It turns each one into a single vector of 384 numbers, and relevance is the cosine similarity between the two vectors. A chunk's vector does not depend on the question, so all chunk vectors can be computed once, before any question is asked, and stored in FAISS. When a question comes in, only the question is encoded and the stored vectors are searched, which is very fast. The weakness is that a whole chunk is squeezed into one vector, and the question and the chunk never "see" each other inside the model. Small but important details, such as "not", "except", or whether a rule is only proposed, can get lost.
+**Bi-encoder.** The bi-encoder reads the question and each chunk *separately*. It turns each one into a single vector of 384 numbers, and relevance is the cosine similarity between the question vector **q** and the chunk vector **d**:
+
+$$\cos(q, d) = \frac{q \cdot d}{\lVert q \rVert \, \lVert d \rVert}$$
+
+Because all vectors are normalised to length 1, this is simply the dot product q · d, which is what FAISS `IndexFlatIP` computes. A chunk's vector does not depend on the question, so all chunk vectors can be computed once, before any question is asked, and stored in FAISS. When a question comes in, only the question is encoded and the stored vectors are searched, which is very fast. The weakness is that a whole chunk is squeezed into one vector, and the question and the chunk never "see" each other inside the model. Small but important details, such as "not", "except", or whether a rule is only proposed, can get lost.
 
 **Cross-encoder.** The cross-encoder reads the question and the chunk *together*, as one input: `[CLS] question [SEP] chunk [SEP]`. Inside the transformer, self-attention connects every word of the question with every word of the chunk, in every layer. The output is one relevance score for the pair, not a vector. This lets the model check whether the chunk really answers the question. The cost is that nothing can be computed in advance: the model has to run again for every (question, chunk) pair.
 
@@ -39,47 +43,89 @@ Both models use the same small 6-layer MiniLM network, so the difference comes f
 
 ## 2. Qualitative & Rank Shift Analysis
 
-I wrote six test questions, one or more for each failure type in the assignment. For each question, the **gold chunk** is the chunk that contains the true answer. I found it by searching the chunks for the exact sentence from the PDF.
+I wrote six test questions that cover the failure types listed in the assignment. For each question I found the **gold chunk**, the chunk that contains the true answer, by searching the chunks for the exact sentence from the PDF. Then I checked where each pipeline ranked it and what the LLM answered.
 
-### 2.1 Rank shifts
+Two terms used below:
 
-| # | Failure type | Question | Gold chunk (PDF page) | Rank: bi-encoder → cross-encoder | Gold in top 3? P1 / P2 |
+- **"Not in context"**: the LLM read the 3 chunks it was given and replied "The provided context does not contain this information." Our prompt tells it to give this reply, instead of guessing, when the answer is not in those 3 chunks.
+- **Omission**: the answer leaves out the information that was asked for. A "not in context" reply is an omission.
+
+### 2.1 Summary of rank shifts
+
+| # | Failure type | Gold chunk (PDF page) | Rank: bi-encoder → cross-encoder | Answer 1 (baseline) | Answer 2 (re-ranked) |
 |---|---|---|---|---|---|
-| 1 | Keyword trap | Maximum working days of leave per semester | 40 (p. 18–19) | #7 → **#1** | No / Yes |
-| 2 | Exception (penalty) | Backing out of an approved event without a valid reason | 22 (p. 13) | #8 → **#1** | No / Yes |
-| 3 | Exception ("except" clause) | Leave for representing the Institute at external events | 21 (p. 12–13) | #5 → **#1** | No / Yes |
-| 4 | Negation | Has any water softener been installed? | 118 (p. 44–45) | #8 → **#2** | No / Yes |
-| 5 | Buried chunk (numbers) | Current monthly stipend for a Quarter TA | 47 (p. 21) | #7 → **#2** | No / Yes |
-| 6 | Limit of re-ranking | Was weekly room cleaning introduced? | 109 (p. 41–42) | #16 → not re-ranked | No / No |
+| 1 | Keyword trap | 40 (p. 18–19) | #7 → **#1** | Omission | Correct |
+| 2 | Exception (penalty) | 22 (p. 13) | #8 → **#1** | Omission | Correct |
+| 3 | Exception ("except" clause) | 21 (p. 12–13) | #5 → **#1** | Omission | Correct (does not say "draft") |
+| 4 | Negation | 118 (p. 44–45) | #8 → **#2** | Omission | Correct |
+| 5 | Buried chunk (numbers) | 47 (p. 21) | #7 → **#2** | Omission | Omission |
+| 6 | Limit of re-ranking | 109 (p. 41–42) | #16 → not re-ranked\* | Incomplete | Incomplete |
 
-### 2.2 Answer 1 vs. Answer 2
+\* Only the bi-encoder's top 10 are re-ranked. This chunk was 16th, so the cross-encoder never scored it. When the cross-encoder scored all 266 chunks (Section 4), it ranked this chunk 2nd.
 
-"Not in context" means the LLM read the 3 chunks it was given and replied "The provided context does not contain this information." Our prompt tells the LLM to give exactly this reply when it cannot find the answer in those chunks, instead of guessing.
+In Pipeline 1 the gold chunk was never among the 3 chunks given to the LLM. After re-ranking, it was among them for Queries 1–5.
 
-| # | Answer 1 (baseline) | Answer 2 (re-ranked) | Verdict |
-|---|---|---|---|
-| 1 | Not in context | "Up to 18 working days of leave in a semester" | A1 omission · A2 correct |
-| 2 | Not in context | "Reduced support for the next event they enter" | A1 omission · A2 correct |
-| 3 | Not in context | "Up to 7 working days … with exceptions for events of high importance", plus two more correct details | A1 omission · A2 correct, but does not say it is a draft |
-| 4 | Not in context | "No softener has been installed" | A1 omission · A2 correct |
-| 5 | Not in context | Not in context | Both omissions, even though P2 had the gold chunk |
-| 6 | "Weekly room cleaning would be possible with more staff" | Same as Answer 1 | Both incomplete: neither says "no" |
+### 2.2 Query-by-query comparison
 
-**Why the baseline missed the gold chunk:**
+#### Query 1: Keyword trap
 
-- **Query 1 (keyword trap):** the top 3 were about a *proposed* 6-day leave limit (Section 3.18) that is on hold. They share the question's words but describe a proposal, not the rule in force.
-- **Query 2 (penalty):** the top 3 were about malpractice penalties (Section 2.10), delays in processing leave (Section 3.8) and Dean's List rules (Section 3.1). None of them is about events. The cross-encoder gave the real penalty sentence +7.6 and every other candidate −1.9 or less, while the bi-encoder's scores for the same ten chunks were all between 0.39 and 0.46.
-- **Query 3 (except clause):** the top 3 had two chunks about the proposed leave limit and chunk 20, which starts the correct policy but is cut off at "A student can receive up to 7" by the chunk boundary. The number and the exception were in the next chunk (chunk 21), which was 5th.
-- **Query 4 (negation):** the top 3 described the softener *plans* ("would be installed … for a 15-day trial", "put the plans on hold"). The bi-encoder could not tell "planned" apart from "not installed". The chunk saying "no softener has been installed" was 8th.
-- **Query 5 (numbers):** the top 3 had the old stipend (Rs. 6,000) and the Parliament's demands (Rs. 8,000). The announced amount, Rs. 7,500, was 7th.
+- **Question:** "What is the maximum number of working days of leave a student can take in a semester?"
+- **True answer** (Section 3.6, PDF p. 19): up to 18 working days per semester.
+- **Chunks given to the LLM:** Pipeline 1: 60, 62, 63 · Pipeline 2: **40**, 21, 61
+- **Why the baseline missed it:** chunks 60, 62 and 63 describe a *proposed* new leave rule (a combined 6-day limit, Section 3.18) that is on hold. They use the same words as the question ("leave", "working days", "limit"), so the bi-encoder ranked them first, even though they describe a proposal and not the rule in force.
+- **Answer 1:** "The provided context does not contain this information." → **Omission**
+- **Answer 2:** "A student can take up to 18 working days of leave in a semester. [1]" → **Correct**
 
-**Where re-ranking was not enough:**
+#### Query 2: Exception (penalty)
 
-- **Query 5:** re-ranking moved the gold chunk to 2nd, so the chunk saying "Rs. 7,500 for a Quarter" was one of the 3 chunks given to the LLM. Even so, the LLM replied "not in context". The same 3 chunks also contained the Parliament's demand of Rs. 8,000 "from Monsoon 2026", and the word "current" does not appear in the text. With two different amounts for the same period, the LLM most likely could not tell which one is the current stipend, so it gave the "not in context" reply instead of picking one. So good retrieval is needed, but it does not always guarantee a good answer.
-- **Query 3:** Answer 2 is correct, but it does not mention that the policy is still a draft. That fact is in chunk 22, which was not in the top 3.
-- **Query 6:** the gold chunk was 16th, so it never reached the cross-encoder. Both answers repeat a related statement but never say "no".
+- **Question:** "What happens to a student who backs out of an approved event without a valid reason?"
+- **True answer** (Section 2.8, PDF p. 13): the student receives reduced support for the next event they enter.
+- **Chunks given to the LLM:** Pipeline 1: 25, 41, 32 · Pipeline 2: **22**, 41, 33
+- **Why the baseline missed it:** its chunks are about malpractice penalties (Section 2.10), delays in processing leave (Section 3.8) and Dean's List rules (Section 3.1). None of them is about events. The bi-encoder's scores for all ten candidates were close together (0.39 to 0.46), so the penalty sentence (chunk 22) ended up 8th. The cross-encoder gave chunk 22 a score of +7.6 and every other candidate −1.9 or less.
+- **Answer 1:** "The provided context does not contain this information." → **Omission**
+- **Answer 2:** "A student who backs out of an approved event without a valid reason receives reduced support for the next event they enter. [1]" → **Correct**
 
-**Did the baseline hallucinate, leave out a clause, or misstate a rule?** In my runs, the baseline never hallucinated and never stated a wrong rule. Every baseline failure was an **omission**: five times it replied "not in context", and once it gave an incomplete answer. I think this is because of the strict prompt, which tells the LLM to give the "not in context" reply instead of guessing when the answer is not in the 3 chunks. Re-ranking brought the gold chunk into the top 3 for **5 of the 6** questions and turned **4 "not in context" replies into correct answers** (Queries 1–4).
+#### Query 3: Exception ("except" clause)
+
+- **Question:** "How many days of leave can a student get for representing the Institute at external events?"
+- **True answer** (Section 2.8, PDF p. 12–13): up to 7 working days per semester, with exceptions for events of high importance. This is a draft policy.
+- **Chunks given to the LLM:** Pipeline 1: 60, 62, 20 · Pipeline 2: **21**, 20, 62
+- **Why the baseline missed it:** two of its chunks are about the proposed leave limit again. Chunk 20 is the start of the correct policy, but the chunk boundary cuts it off at "A student can receive up to 7", so the number and the exception clause are in the next chunk (21), which was 5th.
+- **Answer 1:** "The provided context does not contain this information." → **Omission**
+- **Answer 2:** "A student can receive up to 7 working days of leave per semester for representing the Institute at national events, with exceptions for events of high importance. The leave provisions also apply to international events [1, 2]. However, the Parliament rejected a proposed 6-day limit for leave, stating that it should be raised to at least 12 working days, as a single event can take a week [3]." → **Correct**, including the exception clause. It does not say that the policy is still a draft, because that fact is in chunk 22, which was not given to the LLM.
+
+#### Query 4: Negation
+
+- **Question:** "Has any water softener been installed in the hostels?"
+- **True answer** (Section 6.4, PDF p. 45): no, no softener has been installed.
+- **Chunks given to the LLM:** Pipeline 1: 116, 117, 115 · Pipeline 2: 116, **118**, 117
+- **Why the baseline missed it:** its chunks describe the softener *plans*: a softener "would be installed … for a 15-day trial", and later the committee "put the plans on hold". The bi-encoder could not tell "planned" apart from "not installed", so the chunk with the actual outcome (118) was 8th.
+- **Answer 1:** "The provided context does not contain this information." → **Omission**
+- **Answer 2:** "No softener has been installed. [2]" → **Correct**
+
+#### Query 5: Buried chunk (numbers)
+
+- **Question:** "What is the current monthly stipend for a Quarter Teaching Assistant?"
+- **True answer** (Section 3.13, PDF p. 21): Rs. 7,500 per month, from Monsoon 2026.
+- **Chunks given to the LLM:** Pipeline 1: 49, 51, 44 · Pipeline 2: 49, **47**, 48
+- **Why the baseline missed it:** its chunks contain the old stipend (Rs. 6,000) and the Parliament's demands ("Rs. 8,000 was a reasonable figure"). The chunk with the announced amount (47) was 7th.
+- **Answer 1:** "The provided context does not contain this information." → **Omission**
+- **Answer 2:** "The provided context does not contain this information." → **Omission**, even though chunk 47 was given to the LLM. The same 3 chunks also contained the Parliament's demand of Rs. 8,000 "from Monsoon 2026", and the word "current" does not appear in the text. With two amounts for the same period, the LLM most likely could not tell which one is current, so it gave the "not in context" reply. Re-ranking fixed the retrieval here, but not the answer.
+
+#### Query 6: Limit of re-ranking
+
+- **Question:** "Was weekly room cleaning introduced in the hostels?"
+- **True answer** (Section 6.1, PDF p. 41): no, weekly room cleaning was not introduced during the term.
+- **Chunks given to the LLM:** Pipeline 1: 107, 108, 172 · Pipeline 2: 107, 79, 108
+- **Why both pipelines missed it:** the gold chunk (109) was 16th, so it was not in the top 10 and the cross-encoder never saw it.
+- **Answer 1:** "The Head, CFS stated that weekly room cleaning would be possible with more staff, but did not give a timeline. [2]" → **Incomplete**: it never says "no".
+- **Answer 2:** the same answer, citing [3] → **Incomplete**
+
+### 2.3 What the results show
+
+- **The baseline never hallucinated and never stated a wrong rule.** All of its failures were omissions: five "not in context" replies and one incomplete answer. This is most likely because of the strict prompt, which tells the LLM not to guess.
+- **Re-ranking fixed most failures.** It brought the gold chunk into the top 3 for 5 of the 6 questions and turned 4 omissions into correct answers (Queries 1–4).
+- **Re-ranking has two limits.** Good retrieval does not always give a good answer (Query 5), and the cross-encoder cannot fix a chunk that the bi-encoder did not retrieve (Query 6).
 
 ## 3. Latency Profiling
 
@@ -113,6 +159,13 @@ Even on a GPU, each chunk costs about 2.5–3.2 ms, so the time grows almost in 
 That is why we use two stages. The fast bi-encoder picks a small set of likely chunks from the whole collection, and the slower but more accurate cross-encoder only re-orders that small set. The size of the set, k, is a trade-off between finding the answer and speed: k = 10 took 24.5 ms, k = 50 took 122.4 ms and k = 100 took 306.7 ms.
 
 The two-stage design has one weakness: **the cross-encoder can only re-order what the bi-encoder found.** In Query 6 the gold chunk was 16th, so it was never re-ranked and both pipelines failed. When I let the cross-encoder score all 266 chunks, it put that chunk 2nd, but at about 35 times the cost. So k must be large enough that the right chunk is usually inside the top k.
+
+## Limitations
+
+- I tested only 6 failure questions, and I wrote them myself after reading the document, to show each failure type. They give clear examples, not a full evaluation.
+- In the 8 questions in my notebook (6 failure questions and 2 sanity checks), re-ranking never pushed a correct chunk out of the top 3. But a cross-encoder can also make mistakes, for example when a word in the question matches a passage that uses the same word with a different meaning. I tried only one cross-encoder model.
+- All answers come from one LLM (Gemini 2.5 Flash) with a strict prompt. A different LLM or a less strict prompt might answer differently, for example in Query 5.
+- Latency was measured on one GPU (Tesla T4), so the exact times will be different on other hardware.
 
 ## Conclusion
 
